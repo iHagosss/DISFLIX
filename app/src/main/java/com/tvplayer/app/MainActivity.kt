@@ -1,408 +1,233 @@
 package com.tvplayer.app
 
-import android.app.AlertDialog
-import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.util.Log
 import android.view.KeyEvent
-import android.view.MotionEvent
 import android.view.View
-import android.view.WindowManager
-import android.widget.ImageButton
-import android.widget.ProgressBar
-import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
-import androidx.lifecycle.lifecycleScope
+import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
-import com.tvplayer.app.models.SkipMarkers
-import com.tvplayer.app.skipdetection.SkipDetectionResult
-import com.tvplayer.app.skipdetection.SmartSkipManager
-import com.tvplayer.app.stremio.StremioManager
-import java.util.concurrent.TimeUnit
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
+import com.google.gson.Gson
+import com.google.gson.JsonObject
+import com.tvplayer.app.models.StreamData
+import com.tvplayer.app.skipdetection.SkipSegment
+import com.tvplayer.app.skipdetection.SkipDetectionManager
+import kotlinx.coroutines.*
 
-class MainActivity : AppCompatActivity(), PlayerController.PlayerStateListener {
-
-    companion object {
-        private const val CONTROLS_TIMEOUT = 5000
-        private const val REWIND_MS = 10000L
-        private const val FORWARD_MS = 30000L
-        private const val DPAD_QUICK_SEEK_MS = 10000L
-        private const val TAG = "MainActivity"
-    }
-
-    private lateinit var preferencesHelper: PreferencesHelper
-    private lateinit var skipMarkers: SkipMarkers
-    private lateinit var smartSkipManager: SmartSkipManager
-    private lateinit var playerController: PlayerController
-    private lateinit var uiController: UIController
-
+class MainActivity : AppCompatActivity() {
+    private val TAG = "MainActivity"
     private lateinit var playerView: PlayerView
-    private lateinit var tvCurrentTime: TextView
-    private lateinit var tvTotalTime: TextView
-    private lateinit var tvRemainingTime: TextView
-    private lateinit var tvFinishTime: TextView
-    private lateinit var progressBar: ProgressBar
-    private lateinit var tvTitle: TextView
-    private lateinit var tvEpisode: TextView
-    private lateinit var tvError: TextView
-    private lateinit var customControls: View
-    private lateinit var skipButtonsContainer: View
-    private lateinit var btnPlayPause: ImageButton
-    private lateinit var btnFastForward: ImageButton
-    private lateinit var btnRewind: ImageButton
-
-    private val controlsHandler = Handler(Looper.getMainLooper())
-    private var controlsRunnable: Runnable? = null
-
-    private val stremioManager: StremioManager
-        get() = (application as StremioPlayerApp).stremioManager
+    private var player: ExoPlayer? = null
+    private lateinit var skipDetectionManager: SkipDetectionManager
+    private val coroutineScope = CoroutineScope(Dispatchers.Main + Job())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        // 1. Initialize Views
         playerView = findViewById(R.id.player_view)
-        tvCurrentTime = findViewById(R.id.tv_current_time)
-        tvTotalTime = findViewById(R.id.tv_total_time)
-        tvRemainingTime = findViewById(R.id.tv_remaining_time)
-        tvFinishTime = findViewById(R.id.tv_finish_time)
-        progressBar = findViewById(R.id.progress_bar)
-        tvTitle = findViewById(R.id.tv_title)
-        tvEpisode = findViewById(R.id.tv_episode)
-        tvError = findViewById(R.id.tv_error_message)
-        customControls = findViewById(R.id.custom_controls_container)
-        skipButtonsContainer = findViewById(R.id.skip_buttons_overlay)
-        btnPlayPause = findViewById(R.id.btn_play_pause)
-        btnFastForward = findViewById(R.id.btn_fast_forward)
-        btnRewind = findViewById(R.id.btn_rewind)
+        skipDetectionManager = SkipDetectionManager(this)
 
-        tvError.visibility = View.GONE
+        // Hide system UI for immersive experience
+        window.decorView.systemUiVisibility = (
+            View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+            or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+            or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+            or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+            or View.SYSTEM_UI_FLAG_FULLSCREEN
+        )
 
-        // 2. Initialize Helpers
-        preferencesHelper = PreferencesHelper(this)
-        skipMarkers = SkipMarkers()
-        smartSkipManager = SmartSkipManager(this, preferencesHelper)
-
-        // 3. Initialize Controllers
-        playerController = PlayerController(this, playerView, this)
-        uiController = UIController(this, playerView, playerController, skipMarkers, preferencesHelper)
-
-        uiController.setCustomControls(customControls, skipButtonsContainer)
-        playerController.setHelpers(preferencesHelper, smartSkipManager, skipMarkers)
-
-        btnPlayPause.setOnClickListener {
-            playerController.togglePlayPause()
-            updatePlayPauseButton()
+        // Get stream data from intent
+        val streamDataJson = intent.getStringExtra("streamData")
+        val metaDataJson = intent.getStringExtra("metaData")
+        
+        if (streamDataJson != null) {
+            try {
+                val streamData = decodeStreamData(streamDataJson)
+                if (streamData != null) {
+                    initializePlayer(streamData, metaDataJson)
+                } else {
+                    showError("Failed to decode stream data")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error parsing stream data", e)
+                showError("Error loading stream: ${e.message}")
+            }
+        } else {
+            // For testing, load a sample stream
+            loadSampleStream()
         }
-        btnFastForward.setOnClickListener { playerController.fastForward(FORWARD_MS) }
-        btnRewind.setOnClickListener { playerController.rewind(REWIND_MS) }
-
-        // Use Stremio to resolve and play a stream (temporary test)
-        resolveAndPlayStremioStream()
-
-        resetControlsTimeout()
-        updatePlayPauseButton()
     }
 
-    private fun resolveAndPlayStremioStream() {
-        lifecycleScope.launch {
-            try {
-                // Wait until Stremio core is ready
-                repeat(60) { // ~6 seconds max
-                    if (stremioManager.isReady()) return@repeat
-                    delay(100)
+    private fun decodeStreamData(json: String): StreamData? {
+        return try {
+            val gson = Gson()
+            val jsonObj = gson.fromJson(json, JsonObject::class.java)
+            
+            // Parse the stream data based on Stremio format
+            val url = jsonObj.get("url")?.asString ?: ""
+            val title = jsonObj.get("title")?.asString ?: ""
+            val type = jsonObj.get("type")?.asString ?: "movie"
+            
+            StreamData(
+                url = url,
+                title = title,
+                type = type,
+                subtitles = emptyList() // Parse subtitles if available
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Error decoding stream data", e)
+            null
+        }
+    }
+
+    private fun initializePlayer(streamData: StreamData, metaDataJson: String?) {
+        try {
+            // Initialize ExoPlayer
+            player = ExoPlayer.Builder(this).build()
+            playerView.player = player
+
+            // Parse metadata if available
+            var title = streamData.title
+            var description = ""
+            
+            if (metaDataJson != null) {
+                try {
+                    val gson = Gson()
+                    val metaObj = gson.fromJson(metaDataJson, JsonObject::class.java)
+                    title = metaObj.get("name")?.asString ?: metaObj.get("title")?.asString ?: title
+                    description = metaObj.get("description")?.asString ?: ""
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error parsing metadata", e)
                 }
-                if (!stremioManager.isReady()) {
-                    onPlayerError("Stremio core not ready")
-                    return@launch
-                }
+            }
 
-                // Install at least one stream addon (example: Torrentio)
-                stremioManager.installAddon("https://torrentio.strem.fun/manifest.json")
-
-                val type = "movie"
-                val metaId = "tt0133093" // Example: The Matrix
-
-                stremioManager.loadMetaDetails(
-                    type = type,
-                    id = metaId,
-                    videoId = null
+            // Set up media item
+            val mediaItem = MediaItem.Builder()
+                .setUri(Uri.parse(streamData.url))
+                .setMediaMetadata(
+                    androidx.media3.common.MediaMetadata.Builder()
+                        .setTitle(title)
+                        .setDescription(description)
+                        .build()
                 )
+                .build()
 
-                // Wait for MetaDetails + streams
-                var metaDetails = stremioManager.getMetaDetails()
-                repeat(50) {
-                    val currentMeta = stremioManager.getMetaDetails()
-                    if (currentMeta != null) {
-                        metaDetails = currentMeta
-                        return@repeat
+            player?.apply {
+                setMediaItem(mediaItem)
+                prepare()
+                playWhenReady = true
+                
+                // Add listener for skip detection
+                addListener(object : Player.Listener {
+                    override fun onPlaybackStateChanged(playbackState: Int) {
+                        if (playbackState == Player.STATE_READY) {
+                            // Start skip detection
+                            skipDetectionManager.startDetection(
+                                this@MainActivity.player!!,
+                                streamData.type == "series"
+                            )
+                        }
                     }
-                    delay(100)
-                }
+                })
+            }
 
-                val finalMeta = metaDetails
-                if (finalMeta == null) {
-                    onPlayerError("No meta details found for $metaId")
-                    return@launch
-                }
+            Log.d(TAG, "Player initialized with URL: ${streamData.url}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error initializing player", e)
+            showError("Failed to initialize player: ${e.message}")
+        }
+    }
 
-                // Get the first available stream from streams content
-                val streams = finalMeta.streams
-                val streamList = when (val content = streams?.content) {
-                    is com.stremio.core.models.MetaDetails.Streams.Content.Ready -> content.value
-                    else -> null
-                }
-                val stream = streamList?.firstOrNull()
-                if (stream == null) {
-                    onPlayerError("No streams found for $metaId")
-                    return@launch
-                }
+    private fun loadSampleStream() {
+        // Sample stream for testing
+        val sampleUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
+        val streamData = StreamData(
+            url = sampleUrl,
+            title = "Sample Video - Big Buck Bunny",
+            type = "movie",
+            subtitles = emptyList()
+        )
+        initializePlayer(streamData, null)
+    }
 
-                // Load Player state so Stremio can track progress
-                stremioManager.loadPlayer(
-                    stream = stream,
-                    type = type,
-                    metaId = metaId,
-                    videoId = null
-                )
-
-                val playerState = stremioManager.getPlayer()
-                val streamUrl = playerState?.selected?.stream?.source?.url 
-                    ?: stream.source?.url
-                    ?: ""
-                if (streamUrl.isEmpty()) {
-                    onPlayerError("Stream URL is empty")
-                    return@launch
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        // Handle D-pad navigation for TV
+        when (keyCode) {
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
+                player?.let {
+                    if (it.isPlaying) {
+                        it.pause()
+                    } else {
+                        it.play()
+                    }
                 }
-
-                Log.d(TAG, "Playing Stremio URL: $streamUrl")
-                val mediaUri = Uri.parse(streamUrl)
-
-                playerController.initPlayer(playerView, mediaUri)
-                val metaItem = finalMeta.meta
-                val metaContent = when (val content = metaItem?.content) {
-                    is com.stremio.core.models.MetaDetails.Meta.Content.Ready -> content.value
-                    else -> null
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_LEFT -> {
+                player?.seekBack()
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                player?.seekForward()
+                return true
+            }
+            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
+                player?.let {
+                    if (it.isPlaying) {
+                        it.pause()
+                    } else {
+                        it.play()
+                    }
                 }
-                updateMediaInfo(
-                    title = metaContent?.name,
-                    season = null,
-                    episode = null
-                )
-            } catch (e: Exception) {
-                Log.e(TAG, "Error resolving Stremio stream", e)
-                onPlayerError(e.message ?: "Unknown Stremio error")
+                return true
+            }
+            KeyEvent.KEYCODE_MEDIA_PLAY -> {
+                player?.play()
+                return true
+            }
+            KeyEvent.KEYCODE_MEDIA_PAUSE -> {
+                player?.pause()
+                return true
+            }
+            KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> {
+                player?.seekForward()
+                return true
+            }
+            KeyEvent.KEYCODE_MEDIA_REWIND -> {
+                player?.seekBack()
+                return true
             }
         }
+        return super.onKeyDown(keyCode, event)
     }
 
-    override fun onStart() {
-        super.onStart()
-        playerController.onResume()
+    private fun showError(message: String) {
+        runOnUiThread {
+            Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+            Log.e(TAG, message)
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        player?.pause()
     }
 
     override fun onStop() {
         super.onStop()
-        playerController.onPause()
+        skipDetectionManager.stopDetection()
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        playerController.onDestroy()
-    }
-
-    override fun onProgressUpdate(currentPos: Long, duration: Long) {
-        // Report to Stremio
-        try {
-            stremioManager.updatePlayerTime(currentPos, duration)
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to update Stremio time", e)
-        }
-
-        val currentSeconds = TimeUnit.MILLISECONDS.toSeconds(currentPos)
-        val durationSeconds = TimeUnit.MILLISECONDS.toSeconds(duration)
-
-        val hours = currentSeconds / 3600
-        val minutes = (currentSeconds % 3600) / 60
-        val seconds = currentSeconds % 60
-
-        val durHours = durationSeconds / 3600
-        val durMinutes = (durationSeconds % 3600) / 60
-        val durSeconds = durationSeconds % 60
-
-        val timeStr =
-            if (hours > 0) String.format("%d:%02d:%02d", hours, minutes, seconds)
-            else String.format("%02d:%02d", minutes, seconds)
-        val durStr =
-            if (durHours > 0) String.format("%d:%02d:%02d", durHours, durMinutes, durSeconds)
-            else String.format("%02d:%02d", durMinutes, durSeconds)
-
-        val remainingSeconds = durationSeconds - currentSeconds
-        val remHours = remainingSeconds / 3600
-        val remMinutes = (remainingSeconds % 3600) / 60
-        val remSeconds = remainingSeconds % 60
-        val remStr =
-            if (remHours > 0) String.format("-%d:%02d:%02d", remHours, remMinutes, remSeconds)
-            else String.format("-%02d:%02d", remMinutes, remSeconds)
-
-        tvCurrentTime.text = timeStr
-        tvTotalTime.text = durStr
-        tvRemainingTime.text = remStr
-
-        val remainingMs = duration - currentPos
-        val finishTimeMs = System.currentTimeMillis() + remainingMs
-        val finishFormat = java.text.SimpleDateFormat("h:mm a", java.util.Locale.getDefault())
-        tvFinishTime.text = "Finish ${finishFormat.format(java.util.Date(finishTimeMs))}"
-
-        if (duration > 0) {
-            progressBar.progress = ((currentPos.toDouble() / duration) * 100).toInt()
-        }
-    }
-
-    override fun updateMediaInfo(title: String?, season: Int?, episode: Int?) {
-        tvTitle.text = title ?: "Loading..."
-        if (season != null && episode != null) {
-            tvEpisode.text = String.format("S%02dE%02d", season, episode)
-            tvEpisode.visibility = View.VISIBLE
-        } else {
-            tvEpisode.visibility = View.GONE
-        }
-    }
-
-    override fun onPlayerError(error: String) {
-        tvError.text = "Error: $error"
-        tvError.visibility = View.VISIBLE
-
-        AlertDialog.Builder(this)
-            .setTitle("Playback Error")
-            .setMessage(error)
-            .setPositiveButton("Close") { dialog, _ ->
-                dialog.dismiss()
-                finish()
-            }
-            .setCancelable(false)
-            .show()
-    }
-
-    override fun onPlayerReady() {
-        tvError.visibility = View.GONE
-        updatePlayPauseButton()
-    }
-
-    override fun onMediaEnded() {
-        uiController.handleMediaEnd()
-    }
-
-    override fun onSkipSegmentsDetected(result: SkipDetectionResult) {
-        // No-op, handled via detection complete
-    }
-
-    override fun onDetectionComplete(result: SkipDetectionResult) {
-        uiController.applyDetectedSkipMarkers(result)
-        uiController.showSkipButtons(result)
-    }
-
-    override fun onDetectionFailed(errorMessage: String) {
-        Log.e(TAG, "Skip detection failed: $errorMessage")
-    }
-
-    private fun updatePlayPauseButton() {
-        val playing = playerController.isPlaying()
-        val icon = if (playing) {
-            android.R.drawable.ic_media_pause
-        } else {
-            android.R.drawable.ic_media_play
-        }
-        btnPlayPause.setImageResource(icon)
-
-        try {
-            stremioManager.updatePlayerPaused(!playing)
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to update Stremio paused state", e)
-        }
-    }
-
-    private fun resetControlsTimeout() {
-        controlsRunnable?.let { controlsHandler.removeCallbacks(it) }
-        controlsRunnable = Runnable {
-            customControls.visibility = View.GONE
-            playerView.hideController()
-        }
-        controlsHandler.postDelayed(controlsRunnable!!, CONTROLS_TIMEOUT.toLong())
-    }
-
-    private fun toggleControls() {
-        if (customControls.visibility == View.VISIBLE) {
-            customControls.visibility = View.GONE
-            controlsHandler.removeCallbacks(controlsRunnable!!)
-        } else {
-            customControls.visibility = View.VISIBLE
-            resetControlsTimeout()
-        }
-    }
-
-    override fun onTouchEvent(event: MotionEvent): Boolean {
-        if (event.action == MotionEvent.ACTION_UP) {
-            toggleControls()
-        }
-        return super.onTouchEvent(event)
-    }
-
-    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (customControls.visibility != View.VISIBLE) {
-            customControls.visibility = View.VISIBLE
-            resetControlsTimeout()
-        }
-
-        if (event.action == KeyEvent.ACTION_DOWN) {
-            when (event.keyCode) {
-                KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
-                    playerController.togglePlayPause()
-                    updatePlayPauseButton()
-                    return true
-                }
-
-                KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                    playerController.fastForward(DPAD_QUICK_SEEK_MS)
-                    return true
-                }
-                KeyEvent.KEYCODE_DPAD_LEFT -> {
-                    playerController.rewind(DPAD_QUICK_SEEK_MS)
-                    return true
-                }
-
-                KeyEvent.KEYCODE_MENU -> {
-                    startActivity(Intent(this, SettingsActivity::class.java))
-                    return true
-                }
-
-                KeyEvent.KEYCODE_MEDIA_NEXT -> {
-                    finish()
-                    return true
-                }
-
-                KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
-                    playerController.togglePlayPause()
-                    updatePlayPauseButton()
-                    toggleControls()
-                    return true
-                }
-            }
-        }
-
-        if (playerView.dispatchKeyEvent(event)) {
-            customControls.visibility = View.VISIBLE
-            resetControlsTimeout()
-            return true
-        }
-
-        return super.dispatchKeyEvent(event)
+        player?.release()
+        player = null
+        coroutineScope.cancel()
     }
 }

@@ -14,10 +14,10 @@ class StremioPlayerApp : Application() {
         super.onCreate()
         MultiDex.install(this)
         instance = this
-        
+
         stremioManager = StremioManager(this)
         stremioManager.initialize()
-        
+
         Log.i(TAG, "StremioPlayerApp initialized")
     }
 
@@ -28,7 +28,7 @@ class StremioPlayerApp : Application() {
 
     companion object {
         private const val TAG = "StremioPlayerApp"
-        
+
         lateinit var instance: StremioPlayerApp
             private set
     }

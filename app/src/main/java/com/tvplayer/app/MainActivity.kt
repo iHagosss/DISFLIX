@@ -14,13 +14,16 @@ import android.view.WindowManager
 import android.widget.ImageButton
 import android.widget.ProgressBar
 import android.widget.TextView
-import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.lifecycleScope
 import androidx.media3.ui.PlayerView
 import com.tvplayer.app.models.SkipMarkers
 import com.tvplayer.app.skipdetection.SkipDetectionResult
 import com.tvplayer.app.skipdetection.SmartSkipManager
+import com.tvplayer.app.stremio.StremioManager
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 class MainActivity : AppCompatActivity(), PlayerController.PlayerStateListener {
 
@@ -52,9 +55,12 @@ class MainActivity : AppCompatActivity(), PlayerController.PlayerStateListener {
     private lateinit var btnPlayPause: ImageButton
     private lateinit var btnFastForward: ImageButton
     private lateinit var btnRewind: ImageButton
-    
+
     private val controlsHandler = Handler(Looper.getMainLooper())
     private var controlsRunnable: Runnable? = null
+
+    private val stremioManager: StremioManager
+        get() = (application as StremioPlayerApp).stremioManager
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -76,7 +82,7 @@ class MainActivity : AppCompatActivity(), PlayerController.PlayerStateListener {
         btnPlayPause = findViewById(R.id.btn_play_pause)
         btnFastForward = findViewById(R.id.btn_fast_forward)
         btnRewind = findViewById(R.id.btn_rewind)
-        
+
         tvError.visibility = View.GONE
 
         // 2. Initialize Helpers
@@ -89,23 +95,90 @@ class MainActivity : AppCompatActivity(), PlayerController.PlayerStateListener {
         uiController = UIController(this, playerView, playerController, skipMarkers, preferencesHelper)
 
         uiController.setCustomControls(customControls, skipButtonsContainer)
-        
         playerController.setHelpers(preferencesHelper, smartSkipManager, skipMarkers)
 
-        btnPlayPause.setOnClickListener { playerController.togglePlayPause(); updatePlayPauseButton() }
+        btnPlayPause.setOnClickListener {
+            playerController.togglePlayPause()
+            updatePlayPauseButton()
+        }
         btnFastForward.setOnClickListener { playerController.fastForward(FORWARD_MS) }
         btnRewind.setOnClickListener { playerController.rewind(REWIND_MS) }
 
-        val mediaUri: Uri? = intent.data
-        if (mediaUri != null) {
-            playerController.initPlayer(playerView, mediaUri)
-        } else {
-            Log.e(TAG, "No media URI provided.")
-            onPlayerError("No media file selected.")
-        }
+        // Use Stremio to resolve and play a stream (temporary test)
+        resolveAndPlayStremioStream()
 
         resetControlsTimeout()
         updatePlayPauseButton()
+    }
+
+    private fun resolveAndPlayStremioStream() {
+        lifecycleScope.launch {
+            try {
+                // Wait until Stremio core is ready
+                repeat(60) { // ~6 seconds max
+                    if (stremioManager.isReady()) return@repeat
+                    delay(100)
+                }
+                if (!stremioManager.isReady()) {
+                    onPlayerError("Stremio core not ready")
+                    return@launch
+                }
+
+                // Install at least one stream addon (example: Torrentio)
+                stremioManager.installAddon("https://torrentio.strem.fun/manifest.json")
+
+                val type = "movie"
+                val metaId = "tt0133093" // Example: The Matrix
+
+                stremioManager.loadMetaDetails(
+                    type = type,
+                    id = metaId,
+                    videoId = null
+                )
+
+                // Wait for MetaDetails + streams
+                var meta = stremioManager.getMetaDetails()
+                repeat(50) {
+                    if (meta != null && !meta.streams.isNullOrEmpty()) return@repeat
+                    delay(100)
+                    meta = stremioManager.getMetaDetails()
+                }
+
+                val stream = meta?.streams?.firstOrNull()
+                if (stream == null) {
+                    onPlayerError("No streams found for $metaId")
+                    return@launch
+                }
+
+                // Load Player state so Stremio can track progress
+                stremioManager.loadPlayer(
+                    stream = stream,
+                    type = type,
+                    metaId = metaId,
+                    videoId = null
+                )
+
+                val playerState = stremioManager.getPlayer()
+                val url = playerState?.selected?.stream?.url ?: stream.url
+                if (url.isNullOrEmpty()) {
+                    onPlayerError("Stream URL is empty")
+                    return@launch
+                }
+
+                Log.d(TAG, "Playing Stremio URL: $url")
+                val mediaUri = Uri.parse(url)
+
+                playerController.initPlayer(playerView, mediaUri)
+                updateMediaInfo(
+                    title = meta?.meta?.name,
+                    season = null,
+                    episode = null
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Error resolving Stremio stream", e)
+                onPlayerError(e.message ?: "Unknown Stremio error")
+            }
+        }
     }
 
     override fun onStart() {
@@ -124,40 +197,53 @@ class MainActivity : AppCompatActivity(), PlayerController.PlayerStateListener {
     }
 
     override fun onProgressUpdate(currentPos: Long, duration: Long) {
+        // Report to Stremio
+        try {
+            stremioManager.updatePlayerTime(currentPos, duration)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to update Stremio time", e)
+        }
+
         val currentSeconds = TimeUnit.MILLISECONDS.toSeconds(currentPos)
         val durationSeconds = TimeUnit.MILLISECONDS.toSeconds(duration)
-        
+
         val hours = currentSeconds / 3600
         val minutes = (currentSeconds % 3600) / 60
         val seconds = currentSeconds % 60
-        
+
         val durHours = durationSeconds / 3600
         val durMinutes = (durationSeconds % 3600) / 60
         val durSeconds = durationSeconds % 60
 
-        val timeStr = if (hours > 0) String.format("%d:%02d:%02d", hours, minutes, seconds) else String.format("%02d:%02d", minutes, seconds)
-        val durStr = if (durHours > 0) String.format("%d:%02d:%02d", durHours, durMinutes, durSeconds) else String.format("%02d:%02d", durMinutes, durSeconds)
-        
+        val timeStr =
+            if (hours > 0) String.format("%d:%02d:%02d", hours, minutes, seconds)
+            else String.format("%02d:%02d", minutes, seconds)
+        val durStr =
+            if (durHours > 0) String.format("%d:%02d:%02d", durHours, durMinutes, durSeconds)
+            else String.format("%02d:%02d", durMinutes, durSeconds)
+
         val remainingSeconds = durationSeconds - currentSeconds
         val remHours = remainingSeconds / 3600
         val remMinutes = (remainingSeconds % 3600) / 60
         val remSeconds = remainingSeconds % 60
-        val remStr = if (remHours > 0) String.format("-%d:%02d:%02d", remHours, remMinutes, remSeconds) else String.format("-%02d:%02d", remMinutes, remSeconds)
+        val remStr =
+            if (remHours > 0) String.format("-%d:%02d:%02d", remHours, remMinutes, remSeconds)
+            else String.format("-%02d:%02d", remMinutes, remSeconds)
 
         tvCurrentTime.text = timeStr
         tvTotalTime.text = durStr
         tvRemainingTime.text = remStr
-        
+
         val remainingMs = duration - currentPos
         val finishTimeMs = System.currentTimeMillis() + remainingMs
         val finishFormat = java.text.SimpleDateFormat("h:mm a", java.util.Locale.getDefault())
         tvFinishTime.text = "Finish ${finishFormat.format(java.util.Date(finishTimeMs))}"
-        
+
         if (duration > 0) {
             progressBar.progress = ((currentPos.toDouble() / duration) * 100).toInt()
         }
     }
-    
+
     override fun updateMediaInfo(title: String?, season: Int?, episode: Int?) {
         tvTitle.text = title ?: "Loading..."
         if (season != null && episode != null) {
@@ -171,7 +257,7 @@ class MainActivity : AppCompatActivity(), PlayerController.PlayerStateListener {
     override fun onPlayerError(error: String) {
         tvError.text = "Error: $error"
         tvError.visibility = View.VISIBLE
-        
+
         AlertDialog.Builder(this)
             .setTitle("Playback Error")
             .setMessage(error)
@@ -187,7 +273,7 @@ class MainActivity : AppCompatActivity(), PlayerController.PlayerStateListener {
         tvError.visibility = View.GONE
         updatePlayPauseButton()
     }
-    
+
     override fun onMediaEnded() {
         uiController.handleMediaEnd()
     }
@@ -200,18 +286,25 @@ class MainActivity : AppCompatActivity(), PlayerController.PlayerStateListener {
         uiController.applyDetectedSkipMarkers(result)
         uiController.showSkipButtons(result)
     }
-    
+
     override fun onDetectionFailed(errorMessage: String) {
         Log.e(TAG, "Skip detection failed: $errorMessage")
     }
 
     private fun updatePlayPauseButton() {
-        val icon = if (playerController.isPlaying()) {
+        val playing = playerController.isPlaying()
+        val icon = if (playing) {
             android.R.drawable.ic_media_pause
         } else {
             android.R.drawable.ic_media_play
         }
         btnPlayPause.setImageResource(icon)
+
+        try {
+            stremioManager.updatePlayerPaused(!playing)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to update Stremio paused state", e)
+        }
     }
 
     private fun resetControlsTimeout() {
@@ -232,7 +325,7 @@ class MainActivity : AppCompatActivity(), PlayerController.PlayerStateListener {
             resetControlsTimeout()
         }
     }
-    
+
     override fun onTouchEvent(event: MotionEvent): Boolean {
         if (event.action == MotionEvent.ACTION_UP) {
             toggleControls()
@@ -253,7 +346,7 @@ class MainActivity : AppCompatActivity(), PlayerController.PlayerStateListener {
                     updatePlayPauseButton()
                     return true
                 }
-                
+
                 KeyEvent.KEYCODE_DPAD_RIGHT -> {
                     playerController.fastForward(DPAD_QUICK_SEEK_MS)
                     return true

@@ -1,454 +1,356 @@
 package com.tvplayer.app.stremio
 
-import android.content.Context
 import android.util.Log
+import com.google.gson.Gson
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
 import com.stremio.core.Core
-import com.stremio.core.Field
-import com.stremio.core.models.AddonDetails
-import com.stremio.core.models.CatalogsWithExtra
-import com.stremio.core.models.Ctx
-import com.stremio.core.models.LibraryByType
-import com.stremio.core.models.MetaDetails
-import com.stremio.core.models.Player
-import com.stremio.core.runtime.RuntimeEvent
-import com.stremio.core.runtime.msg.Action
-import com.stremio.core.runtime.msg.ActionCtx
-import com.stremio.core.runtime.msg.ActionLoad
-import com.stremio.core.runtime.msg.ActionPlayer
-import com.stremio.core.types.AddonDescriptor
-import com.stremio.core.types.ResourcePath
-import com.stremio.core.types.ResourceRequest
-import com.stremio.core.types.resource.Stream
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.launch
+import com.stremio.core.Env
+import com.stremio.core.models.*
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 
-class StremioManager(private val context: Context) {
+class StremioManager(private val storage: StremioStorage) {
+    private val TAG = "StremioManager"
+    private var core: Core? = null
+    private val coroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val gson = Gson()
+    
+    private val _isReady = MutableStateFlow(false)
+    val isReady: StateFlow<Boolean> = _isReady
 
-    companion object {
-        private const val TAG = "StremioManager"
-        private const val CINEMETA_MANIFEST = "https://v3-cinemeta.strem.io/manifest.json"
-    }
+    private val _catalogs = MutableStateFlow<List<JsonObject>>(emptyList())
+    val catalogs: StateFlow<List<JsonObject>> = _catalogs
 
-    private val storage = StremioStorage(context)
-    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private val _metaDetails = MutableStateFlow<JsonObject?>(null)
+    val metaDetails: StateFlow<JsonObject?> = _metaDetails
 
-    private var isInitialized = false
-    private var isContextLoaded = false
-    private val eventListeners = mutableListOf<StremioEventListener>()
-
-    private val coreEventListener = Core.EventListener { event ->
-        Log.d(TAG, "Core event received: ${event.javaClass.simpleName}")
-        handleCoreEvent(event)
-        notifyEventListeners(event)
-    }
-
-    interface StremioEventListener {
-        fun onCoreEvent(event: RuntimeEvent)
-        fun onContextLoaded()
-        fun onInitialized()
-        fun onError(error: String)
-    }
-
-    private fun handleCoreEvent(event: RuntimeEvent) {
-        when (val eventType = event.type) {
-            is RuntimeEvent.Type.CtxLoaded -> {
-                isContextLoaded = true
-                Log.i(TAG, "Context loaded")
-                installDefaultAddonsIfNeeded()
-                loadLibrary()
-                notifyContextLoaded()
-            }
-            is RuntimeEvent.Type.AddonDetailsResult -> {
-                Log.i(TAG, "Addon details loaded")
-                val result = eventType.value
-                result.content?.let { content ->
-                    when (val loadable = content.content) {
-                        is AddonDetails.Content.Content.Ready -> {
-                            val descriptor = loadable.value
-                            Log.i(TAG, "Installing addon: ${descriptor.manifest?.name}")
-                            installAddonWithDescriptor(descriptor)
-                        }
-                        else -> Log.w(TAG, "Addon details not ready")
-                    }
-                }
-            }
-            is RuntimeEvent.Type.AddonInstalled -> {
-                Log.i(TAG, "Addon installed: ${eventType.value}")
-                loadLibrary()
-            }
-            is RuntimeEvent.Type.Error -> {
-                Log.e(TAG, "Core error: ${eventType.value}")
-            }
-            else -> {
-                Log.d(TAG, "Unhandled event type: $eventType")
-            }
-        }
-    }
-
-    private fun installDefaultAddonsIfNeeded() {
-        try {
-            val addons = getInstalledAddons()
-            val hasCinemeta = addons.any { it.transportUrl.contains("cinemeta") }
-
-            if (!hasCinemeta) {
-                Log.i(TAG, "Loading default Cinemeta addon details")
-                loadAddonDetails(CINEMETA_MANIFEST)
-            } else {
-                Log.d(TAG, "Cinemeta addon already installed")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error checking/installing default addons", e)
-        }
-    }
-
-    private fun loadAddonDetails(transportUrl: String) {
-        try {
-            val selected = AddonDetails.Selected(transportUrl = transportUrl)
-            val action = Action(
-                type = Action.Type.Load(
-                    ActionLoad(args = ActionLoad.Args.AddonDetails(selected))
-                )
-            )
-            Core.dispatch(action, Field.AddonDetails)
-            Log.d(TAG, "Dispatched addon details load for $transportUrl")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error loading addon details", e)
-        }
-    }
+    private val _streams = MutableStateFlow<List<JsonObject>>(emptyList())
+    val streams: StateFlow<List<JsonObject>> = _streams
 
     fun initialize() {
-        if (isInitialized) return
+        coroutineScope.launch {
+            try {
+                Log.d(TAG, "Initializing Stremio Core...")
+                
+                // Create environment
+                val env = Env()
+                
+                // Initialize Core with storage
+                core = Core.initialize(storage, env)
+                
+                _isReady.value = true
+                Log.d(TAG, "Stremio Core initialized successfully")
+                
+                // Load default addons
+                loadDefaultAddons()
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to initialize Stremio Core", e)
+                _isReady.value = false
+            }
+        }
+    }
 
+    private suspend fun loadDefaultAddons() {
         try {
-            val error = Core.initialize(storage)
-            if (error != null) {
-                Log.e(TAG, "Core initialization error: ${error.message}")
-                notifyError(error.message ?: "Unknown initialization error")
-                return
+            // Add default Stremio addons
+            val defaultAddons = listOf(
+                "https://v3-cinemeta.strem.io/manifest.json",
+                "https://v3-channels.strem.io/manifest.json"
+            )
+            
+            for (addonUrl in defaultAddons) {
+                installAddon(addonUrl)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error loading default addons", e)
+        }
+    }
+
+    fun loadCatalog(type: String, catalogId: String = "top", extra: Map<String, String> = emptyMap()) {
+        coroutineScope.launch {
+            try {
+                if (!_isReady.value || core == null) {
+                    Log.w(TAG, "Core not ready")
+                    return@launch
+                }
+
+                Log.d(TAG, "Loading catalog: type=$type, id=$catalogId")
+                
+                // Dispatch catalog load action
+                val action = JsonObject().apply {
+                    addProperty("type", "Load")
+                    add("args", JsonObject().apply {
+                        addProperty("model", "CatalogsWithExtra")
+                        add("args", JsonObject().apply {
+                            addProperty("type", type)
+                            addProperty("id", catalogId)
+                            add("extra", gson.toJsonTree(extra))
+                        })
+                    })
+                }
+                
+                core?.dispatch(action.toString(), "ctx")
+                
+                // Get catalog state
+                delay(500) // Wait for state update
+                val state = core?.getState<String>("ctx.content.catalogs")
+                if (state != null) {
+                    val catalogs = parseCatalogs(state)
+                    _catalogs.value = catalogs
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error loading catalog", e)
+            }
+        }
+    }
+
+    fun loadMetaDetails(type: String, id: String) {
+        coroutineScope.launch {
+            try {
+                if (!_isReady.value || core == null) {
+                    Log.w(TAG, "Core not ready")
+                    return@launch
+                }
+
+                Log.d(TAG, "Loading meta details: type=$type, id=$id")
+                
+                // Dispatch meta load action
+                val action = JsonObject().apply {
+                    addProperty("type", "Load")
+                    add("args", JsonObject().apply {
+                        addProperty("model", "MetaDetails")
+                        add("args", JsonObject().apply {
+                            addProperty("type", type)
+                            addProperty("id", id)
+                        })
+                    })
+                }
+                
+                core?.dispatch(action.toString(), "ctx")
+                
+                // Get meta state
+                delay(500) // Wait for state update
+                val state = core?.getState<String>("ctx.content.metaDetails")
+                if (state != null) {
+                    val meta = JsonParser.parseString(state).asJsonObject
+                    _metaDetails.value = meta
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error loading meta details", e)
+            }
+        }
+    }
+
+    fun loadStreams(type: String, id: String) {
+        coroutineScope.launch {
+            try {
+                if (!_isReady.value || core == null) {
+                    Log.w(TAG, "Core not ready")
+                    return@launch
+                }
+
+                Log.d(TAG, "Loading streams: type=$type, id=$id")
+                
+                // Dispatch streams load action
+                val action = JsonObject().apply {
+                    addProperty("type", "Load")
+                    add("args", JsonObject().apply {
+                        addProperty("model", "Streams")
+                        add("args", JsonObject().apply {
+                            addProperty("type", type)
+                            addProperty("id", id)
+                        })
+                    })
+                }
+                
+                core?.dispatch(action.toString(), "player")
+                
+                // Get streams state
+                delay(1000) // Wait for state update
+                val state = core?.getState<String>("player.streams")
+                if (state != null) {
+                    val streams = parseStreams(state)
+                    _streams.value = streams
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error loading streams", e)
+            }
+        }
+    }
+
+    suspend fun installAddon(manifestUrl: String): Boolean {
+        return try {
+            if (!_isReady.value || core == null) {
+                Log.w(TAG, "Core not ready")
+                return false
             }
 
-            Core.addEventListener(coreEventListener)
-
-            isInitialized = true
-            notifyInitialized()
-            Log.i(TAG, "Stremio Core initialized successfully")
+            Log.d(TAG, "Installing addon: $manifestUrl")
+            
+            val action = JsonObject().apply {
+                addProperty("type", "InstallAddon")
+                add("args", JsonObject().apply {
+                    addProperty("transportUrl", manifestUrl)
+                })
+            }
+            
+            core?.dispatch(action.toString(), "ctx")
+            delay(500)
+            
+            Log.d(TAG, "Addon installed: $manifestUrl")
+            true
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize Stremio Core", e)
-            notifyError(e.message ?: "Initialization failed")
+            Log.e(TAG, "Error installing addon", e)
+            false
         }
     }
 
-    private fun loadLibrary() {
-        try {
-            val selected = LibraryByType.Selected(type = "")
-            val action = Action(
-                type = Action.Type.Load(
-                    ActionLoad(args = ActionLoad.Args.LibraryByType(selected))
-                )
-            )
-            Core.dispatch(action, Field.LibraryByType)
-            Log.d(TAG, "Dispatched LoadLibrary action")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error loading library", e)
-        }
-    }
-
-    fun addEventListener(listener: StremioEventListener) {
-        eventListeners.add(listener)
-    }
-
-    fun removeEventListener(listener: StremioEventListener) {
-        eventListeners.remove(listener)
-    }
-
-    private fun notifyEventListeners(event: RuntimeEvent) {
-        scope.launch {
-            eventListeners.forEach { it.onCoreEvent(event) }
-        }
-    }
-
-    private fun notifyContextLoaded() {
-        scope.launch {
-            eventListeners.forEach { it.onContextLoaded() }
-        }
-    }
-
-    private fun notifyInitialized() {
-        scope.launch {
-            eventListeners.forEach { it.onInitialized() }
-        }
-    }
-
-    private fun notifyError(error: String) {
-        scope.launch {
-            eventListeners.forEach { it.onError(error) }
-        }
-    }
-
-    fun getContext(): Ctx? {
+    suspend fun uninstallAddon(transportUrl: String): Boolean {
         return try {
-            Core.getState<Ctx>(Field.Ctx)
+            if (!_isReady.value || core == null) {
+                Log.w(TAG, "Core not ready")
+                return false
+            }
+
+            Log.d(TAG, "Uninstalling addon: $transportUrl")
+            
+            val action = JsonObject().apply {
+                addProperty("type", "UninstallAddon")
+                add("args", JsonObject().apply {
+                    addProperty("transportUrl", transportUrl)
+                })
+            }
+            
+            core?.dispatch(action.toString(), "ctx")
+            delay(500)
+            
+            Log.d(TAG, "Addon uninstalled: $transportUrl")
+            true
         } catch (e: Exception) {
-            Log.e(TAG, "Error getting context", e)
-            null
+            Log.e(TAG, "Error uninstalling addon", e)
+            false
         }
     }
 
-    fun isReady(): Boolean = isInitialized && isContextLoaded
-
-    fun getInstalledAddons(): List<AddonDescriptor> {
+    fun getInstalledAddons(): List<JsonObject> {
         return try {
-            val ctx = getContext()
-            ctx?.profile?.addons ?: emptyList()
+            if (!_isReady.value || core == null) {
+                Log.w(TAG, "Core not ready")
+                return emptyList()
+            }
+
+            val state = core?.getState<String>("ctx.addons")
+            if (state != null) {
+                parseAddons(state)
+            } else {
+                emptyList()
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "Error getting addons", e)
+            Log.e(TAG, "Error getting installed addons", e)
             emptyList()
         }
     }
 
-    fun findAddonForResource(resource: String, type: String): AddonDescriptor? {
-        return getInstalledAddons().find { descriptor ->
-            descriptor.manifest?.resources?.any { res ->
-                res.name == resource && (res.types.contains(type) || res.types.isEmpty())
-            } == true
-        }
-    }
+    fun updatePlayerPosition(time: Long, duration: Long) {
+        coroutineScope.launch {
+            try {
+                if (!_isReady.value || core == null) return@launch
 
-    fun loadCatalog(type: String, catalogId: String, addon: AddonDescriptor? = null) {
-        try {
-            val targetAddon = addon ?: findAddonForResource("catalog", type)
-            if (targetAddon == null) {
-                Log.w(TAG, "No addon found for catalog type: $type")
-                return
-            }
-
-            val request = ResourceRequest(
-                base = targetAddon.transportUrl,
-                path = ResourcePath(
-                    resource = "catalog",
-                    type = type,
-                    id = catalogId
-                )
-            )
-
-            val selected = CatalogsWithExtra.Selected(request = request)
-            val action = Action(
-                type = Action.Type.Load(
-                    ActionLoad(args = ActionLoad.Args.CatalogsWithExtra(selected))
-                )
-            )
-
-            Core.dispatch(action, Field.CatalogsWithExtra)
-            Log.d(TAG, "Dispatched catalog load for $type/$catalogId")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error loading catalog", e)
-        }
-    }
-
-    fun getCatalogsWithExtra(): CatalogsWithExtra? {
-        return try {
-            Core.getState<CatalogsWithExtra>(Field.CatalogsWithExtra)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error getting catalogs", e)
-            null
-        }
-    }
-
-    fun loadMetaDetails(type: String, id: String, videoId: String? = null, addon: AddonDescriptor? = null) {
-        try {
-            val targetAddon = addon ?: findAddonForResource("meta", type)
-            if (targetAddon == null) {
-                Log.w(TAG, "No addon found for meta type: $type")
-                return
-            }
-
-            val metaPath = ResourcePath(
-                resource = "meta",
-                type = type,
-                id = id
-            )
-
-            val streamPath = videoId?.let {
-                ResourcePath(
-                    resource = "stream",
-                    type = type,
-                    id = it
-                )
-            }
-
-            val selected = MetaDetails.Selected(
-                metaPath = metaPath,
-                streamPath = streamPath,
-                guessStreamPath = streamPath == null
-            )
-            val action = Action(
-                type = Action.Type.Load(
-                    ActionLoad(args = ActionLoad.Args.MetaDetails(selected))
-                )
-            )
-
-            Core.dispatch(action, Field.MetaDetails)
-            Log.d(TAG, "Dispatched meta details load for $type/$id")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error loading meta details", e)
-        }
-    }
-
-    fun getMetaDetails(): MetaDetails? {
-        return try {
-            Core.getState<MetaDetails>(Field.MetaDetails)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error getting meta details", e)
-            null
-        }
-    }
-
-    fun loadPlayer(stream: Stream, type: String, metaId: String, videoId: String?) {
-        try {
-            val addon = findAddonForResource("meta", type)
-
-            val metaRequest = addon?.let {
-                ResourceRequest(
-                    base = it.transportUrl,
-                    path = ResourcePath(
-                        resource = "meta",
-                        type = type,
-                        id = metaId
-                    )
-                )
-            }
-
-            val streamRequest = videoId?.let { vid ->
-                addon?.let {
-                    ResourceRequest(
-                        base = it.transportUrl,
-                        path = ResourcePath(
-                            resource = "stream",
-                            type = type,
-                            id = vid
-                        )
-                    )
+                val action = JsonObject().apply {
+                    addProperty("type", "TimeChanged")
+                    add("args", JsonObject().apply {
+                        addProperty("time", time)
+                        addProperty("duration", duration)
+                    })
                 }
+                
+                core?.dispatch(action.toString(), "player")
+            } catch (e: Exception) {
+                Log.e(TAG, "Error updating player position", e)
             }
-
-            val selected = Player.Selected(
-                stream = stream,
-                metaRequest = metaRequest,
-                streamRequest = streamRequest
-            )
-            val action = Action(
-                type = Action.Type.Load(
-                    ActionLoad(args = ActionLoad.Args.Player(selected))
-                )
-            )
-
-            Core.dispatch(action, Field.Player)
-            Log.d(TAG, "Dispatched player load")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error loading player", e)
         }
     }
 
-    fun getPlayer(): Player? {
-        return try {
-            Core.getState<Player>(Field.Player)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error getting player state", e)
-            null
+    fun notifyPlaybackEnded() {
+        coroutineScope.launch {
+            try {
+                if (!_isReady.value || core == null) return@launch
+
+                val action = JsonObject().apply {
+                    addProperty("type", "Ended")
+                }
+                
+                core?.dispatch(action.toString(), "player")
+            } catch (e: Exception) {
+                Log.e(TAG, "Error notifying playback ended", e)
+            }
         }
     }
 
-    fun decodeStreamData(streamData: String): Stream? {
+    private fun parseCatalogs(json: String): List<JsonObject> {
         return try {
-            Core.decodeStreamData(streamData)
+            val element = JsonParser.parseString(json)
+            if (element.isJsonArray) {
+                element.asJsonArray.map { it.asJsonObject }
+            } else {
+                emptyList()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error parsing catalogs", e)
+            emptyList()
+        }
+    }
+
+    private fun parseStreams(json: String): List<JsonObject> {
+        return try {
+            val element = JsonParser.parseString(json)
+            if (element.isJsonArray) {
+                element.asJsonArray.map { it.asJsonObject }
+            } else if (element.isJsonObject) {
+                val obj = element.asJsonObject
+                if (obj.has("streams") && obj.get("streams").isJsonArray) {
+                    obj.getAsJsonArray("streams").map { it.asJsonObject }
+                } else {
+                    emptyList()
+                }
+            } else {
+                emptyList()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error parsing streams", e)
+            emptyList()
+        }
+    }
+
+    private fun parseAddons(json: String): List<JsonObject> {
+        return try {
+            val element = JsonParser.parseString(json)
+            if (element.isJsonArray) {
+                element.asJsonArray.map { it.asJsonObject }
+            } else {
+                emptyList()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error parsing addons", e)
+            emptyList()
+        }
+    }
+
+    fun decodeStreamData(streamJson: String): JsonObject? {
+        return try {
+            JsonParser.parseString(streamJson).asJsonObject
         } catch (e: Exception) {
             Log.e(TAG, "Error decoding stream data", e)
             null
         }
     }
 
-    fun installAddon(transportUrl: String) {
-        loadAddonDetails(transportUrl)
-    }
-
-    private fun installAddonWithDescriptor(descriptor: AddonDescriptor) {
-        try {
-            val action = Action(
-                type = Action.Type.Ctx(
-                    ActionCtx(args = ActionCtx.Args.InstallAddon(descriptor))
-                )
-            )
-
-            Core.dispatch(action, null)
-            Log.d(TAG, "Dispatched addon install for ${descriptor.transportUrl}")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error installing addon", e)
-        }
-    }
-
-    fun uninstallAddon(transportUrl: String) {
-        try {
-            val descriptor = AddonDescriptor(
-                transportUrl = transportUrl,
-                manifest = null
-            )
-            val action = Action(
-                type = Action.Type.Ctx(
-                    ActionCtx(args = ActionCtx.Args.UninstallAddon(descriptor))
-                )
-            )
-
-            Core.dispatch(action, null)
-            Log.d(TAG, "Dispatched addon uninstall for $transportUrl")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error uninstalling addon", e)
-        }
-    }
-
-    fun updatePlayerTime(currentTime: Long, duration: Long) {
-        try {
-            val playerItemState = ActionPlayer.PlayerItemState(
-                time = currentTime.toULong(),
-                duration = duration.toULong(),
-                device = "android"
-            )
-            val action = Action(
-                type = Action.Type.Player(
-                    ActionPlayer(args = ActionPlayer.Args.TimeChanged(playerItemState))
-                )
-            )
-
-            Core.dispatch(action, Field.Player)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error updating player time", e)
-        }
-    }
-
-    fun updatePlayerPaused(paused: Boolean) {
-        try {
-            val action = Action(
-                type = Action.Type.Player(
-                    ActionPlayer(args = ActionPlayer.Args.PausedChanged(paused))
-                )
-            )
-
-            Core.dispatch(action, Field.Player)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error updating player paused state", e)
-        }
-    }
-
     fun shutdown() {
-        try {
-            Core.removeEventListener(coreEventListener)
-            scope.cancel()
-            isInitialized = false
-            isContextLoaded = false
-        } catch (e: Exception) {
-            Log.e(TAG, "Error during shutdown", e)
-        }
+        coroutineScope.cancel()
+        core = null
+        _isReady.value = false
+        Log.d(TAG, "StremioManager shutdown")
     }
 }

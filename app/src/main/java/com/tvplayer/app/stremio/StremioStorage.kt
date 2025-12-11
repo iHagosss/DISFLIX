@@ -8,14 +8,15 @@ import kotlin.concurrent.read
 import kotlin.concurrent.write
 
 class StremioStorage(context: Context) : Storage {
-    
+
     companion object {
         private const val PREFS_NAME = "stremio_core_storage"
     }
-    
-    private val prefs: SharedPreferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    private val prefs: SharedPreferences =
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val lock = ReentrantReadWriteLock()
-    
+
     override fun get(key: String): Storage.Result<String?> {
         return lock.read {
             try {
@@ -26,7 +27,7 @@ class StremioStorage(context: Context) : Storage {
             }
         }
     }
-    
+
     override fun set(key: String, value: String?): Storage.Result<Unit> {
         return lock.write {
             try {

@@ -69,6 +69,11 @@ Tag with `v*` pattern (e.g., `v1.0.0`) to automatically create GitHub releases w
 
 ## Recent Changes
 
+- **December 2025**: Fixed build errors for stremio-core-kotlin 1.11.2:
+  - Updated JVM target from 17 to 21 (required by stremio-core-kotlin 1.11.2)
+  - Updated GitHub Actions workflow to use JDK 21
+  - Fixed StremioManager.kt to use correct pbandk sealed class API pattern
+  - Fixed MainActivity.kt to properly handle MetaDetails sealed class wrappers
 - Integrated Stremio Core Kotlin SDK v1.11.2 via JitPack
 - Created StremioManager as proper wrapper around Core SDK
 - Created thread-safe StremioStorage implementing Core's Storage interface
@@ -80,4 +85,8 @@ Tag with `v*` pattern (e.g., `v1.0.0`) to automatically create GitHub releases w
 
 ## SDK Integration Notes
 
-The stremio-core-kotlin SDK uses Rust/JNI with protobuf serialization. The generated protobuf types (ActionLoad, ActionCtx, etc.) have specific field structures that may require adjustment based on runtime testing with the actual SDK binaries.
+The stremio-core-kotlin SDK uses Rust/JNI with protobuf serialization (pbandk). Key API patterns:
+- Action types use sealed classes: `Action(type = Action.Type.Load(ActionLoad(...)))`
+- ActionLoad uses sealed args: `ActionLoad(args = ActionLoad.Args.MetaDetails(selected))`
+- RuntimeEvent uses sealed type: `when (event.type) { is RuntimeEvent.Type.CtxLoaded -> ... }`
+- MetaDetails content uses sealed loadable wrappers

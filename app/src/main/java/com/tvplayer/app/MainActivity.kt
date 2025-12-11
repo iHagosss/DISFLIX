@@ -137,14 +137,29 @@ class MainActivity : AppCompatActivity(), PlayerController.PlayerStateListener {
                 )
 
                 // Wait for MetaDetails + streams
-                var meta = stremioManager.getMetaDetails()
+                var metaDetails = stremioManager.getMetaDetails()
                 repeat(50) {
-                    if (meta != null && !meta.streams.isNullOrEmpty()) return@repeat
+                    val currentMeta = stremioManager.getMetaDetails()
+                    if (currentMeta != null) {
+                        metaDetails = currentMeta
+                        return@repeat
+                    }
                     delay(100)
-                    meta = stremioManager.getMetaDetails()
                 }
 
-                val stream = meta?.streams?.firstOrNull()
+                val finalMeta = metaDetails
+                if (finalMeta == null) {
+                    onPlayerError("No meta details found for $metaId")
+                    return@launch
+                }
+
+                // Get the first available stream from streams content
+                val streams = finalMeta.streams
+                val streamList = when (val content = streams?.content) {
+                    is com.stremio.core.models.MetaDetails.Streams.Content.Ready -> content.value
+                    else -> null
+                }
+                val stream = streamList?.firstOrNull()
                 if (stream == null) {
                     onPlayerError("No streams found for $metaId")
                     return@launch
@@ -159,18 +174,25 @@ class MainActivity : AppCompatActivity(), PlayerController.PlayerStateListener {
                 )
 
                 val playerState = stremioManager.getPlayer()
-                val url = playerState?.selected?.stream?.url ?: stream.url
-                if (url.isNullOrEmpty()) {
+                val streamUrl = playerState?.selected?.stream?.source?.url 
+                    ?: stream.source?.url
+                    ?: ""
+                if (streamUrl.isEmpty()) {
                     onPlayerError("Stream URL is empty")
                     return@launch
                 }
 
-                Log.d(TAG, "Playing Stremio URL: $url")
-                val mediaUri = Uri.parse(url)
+                Log.d(TAG, "Playing Stremio URL: $streamUrl")
+                val mediaUri = Uri.parse(streamUrl)
 
                 playerController.initPlayer(playerView, mediaUri)
+                val metaItem = finalMeta.meta
+                val metaContent = when (val content = metaItem?.content) {
+                    is com.stremio.core.models.MetaDetails.Meta.Content.Ready -> content.value
+                    else -> null
+                }
                 updateMediaInfo(
-                    title = meta?.meta?.name,
+                    title = metaContent?.name,
                     season = null,
                     episode = null
                 )

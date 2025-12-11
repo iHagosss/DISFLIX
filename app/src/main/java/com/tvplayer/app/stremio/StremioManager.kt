@@ -4,8 +4,10 @@ import android.content.Context
 import android.util.Log
 import com.stremio.core.Core
 import com.stremio.core.Field
+import com.stremio.core.models.AddonDetails
 import com.stremio.core.models.CatalogsWithExtra
 import com.stremio.core.models.Ctx
+import com.stremio.core.models.LibraryByType
 import com.stremio.core.models.MetaDetails
 import com.stremio.core.models.Player
 import com.stremio.core.runtime.RuntimeEvent
@@ -13,13 +15,14 @@ import com.stremio.core.runtime.msg.Action
 import com.stremio.core.runtime.msg.ActionCtx
 import com.stremio.core.runtime.msg.ActionLoad
 import com.stremio.core.runtime.msg.ActionPlayer
-import com.stremio.core.types.addon.Descriptor
-import com.stremio.core.types.addon.ResourcePath
-import com.stremio.core.types.addon.ResourceRequest
+import com.stremio.core.types.AddonDescriptor
+import com.stremio.core.types.ResourcePath
+import com.stremio.core.types.ResourceRequest
 import com.stremio.core.types.resource.Stream
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 
 class StremioManager(private val context: Context) {
@@ -50,29 +53,37 @@ class StremioManager(private val context: Context) {
     }
 
     private fun handleCoreEvent(event: RuntimeEvent) {
-        when {
-            event.ctxLoaded != null -> {
+        when (val eventType = event.type) {
+            is RuntimeEvent.Type.CtxLoaded -> {
                 isContextLoaded = true
                 Log.i(TAG, "Context loaded")
                 installDefaultAddonsIfNeeded()
                 loadLibrary()
                 notifyContextLoaded()
             }
-            event.addonDetailsResult != null -> {
+            is RuntimeEvent.Type.AddonDetailsResult -> {
                 Log.i(TAG, "Addon details loaded")
-                event.addonDetailsResult?.descriptor?.let { descriptor ->
-                    if (descriptor.manifest != null) {
-                        Log.i(TAG, "Installing addon: ${descriptor.manifest?.name}")
-                        installAddonWithDescriptor(descriptor)
+                val result = eventType.value
+                result.content?.let { content ->
+                    when (val loadable = content.content) {
+                        is AddonDetails.Content.Content.Ready -> {
+                            val descriptor = loadable.value
+                            Log.i(TAG, "Installing addon: ${descriptor.manifest?.name}")
+                            installAddonWithDescriptor(descriptor)
+                        }
+                        else -> Log.w(TAG, "Addon details not ready")
                     }
                 }
             }
-            event.addonInstalled != null -> {
-                Log.i(TAG, "Addon installed: ${event.addonInstalled}")
+            is RuntimeEvent.Type.AddonInstalled -> {
+                Log.i(TAG, "Addon installed: ${eventType.value}")
                 loadLibrary()
             }
-            event.error != null -> {
-                Log.e(TAG, "Core error: ${event.error}")
+            is RuntimeEvent.Type.Error -> {
+                Log.e(TAG, "Core error: ${eventType.value}")
+            }
+            else -> {
+                Log.d(TAG, "Unhandled event type: $eventType")
             }
         }
     }
@@ -95,13 +106,10 @@ class StremioManager(private val context: Context) {
 
     private fun loadAddonDetails(transportUrl: String) {
         try {
+            val selected = AddonDetails.Selected(transportUrl = transportUrl)
             val action = Action(
-                load = ActionLoad(
-                    addonDetails = ActionLoad.AddonDetails(
-                        selected = ActionLoad.AddonDetails.Selected(
-                            transportUrl = transportUrl
-                        )
-                    )
+                type = Action.Type.Load(
+                    ActionLoad(args = ActionLoad.Args.AddonDetails(selected))
                 )
             )
             Core.dispatch(action, Field.AddonDetails)
@@ -124,8 +132,6 @@ class StremioManager(private val context: Context) {
 
             Core.addEventListener(coreEventListener)
 
-            loadContext()
-
             isInitialized = true
             notifyInitialized()
             Log.i(TAG, "Stremio Core initialized successfully")
@@ -135,25 +141,12 @@ class StremioManager(private val context: Context) {
         }
     }
 
-    private fun loadContext() {
-        try {
-            val action = Action(
-                load = ActionLoad(
-                    ctx = ActionLoad.Ctx()
-                )
-            )
-            Core.dispatch(action, null)
-            Log.d(TAG, "Dispatched LoadCtx action")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error loading context", e)
-        }
-    }
-
     private fun loadLibrary() {
         try {
+            val selected = LibraryByType.Selected(type = "")
             val action = Action(
-                load = ActionLoad(
-                    libraryByType = ActionLoad.LibraryByType()
+                type = Action.Type.Load(
+                    ActionLoad(args = ActionLoad.Args.LibraryByType(selected))
                 )
             )
             Core.dispatch(action, Field.LibraryByType)
@@ -206,7 +199,7 @@ class StremioManager(private val context: Context) {
 
     fun isReady(): Boolean = isInitialized && isContextLoaded
 
-    fun getInstalledAddons(): List<Descriptor> {
+    fun getInstalledAddons(): List<AddonDescriptor> {
         return try {
             val ctx = getContext()
             ctx?.profile?.addons ?: emptyList()
@@ -216,15 +209,15 @@ class StremioManager(private val context: Context) {
         }
     }
 
-    fun findAddonForResource(resource: String, type: String): Descriptor? {
+    fun findAddonForResource(resource: String, type: String): AddonDescriptor? {
         return getInstalledAddons().find { descriptor ->
             descriptor.manifest?.resources?.any { res ->
-                res.name == resource && (res.types?.contains(type) == true || res.types == null)
+                res.name == resource && (res.types.contains(type) || res.types.isEmpty())
             } == true
         }
     }
 
-    fun loadCatalog(type: String, catalogId: String, addon: Descriptor? = null) {
+    fun loadCatalog(type: String, catalogId: String, addon: AddonDescriptor? = null) {
         try {
             val targetAddon = addon ?: findAddonForResource("catalog", type)
             if (targetAddon == null) {
@@ -236,16 +229,15 @@ class StremioManager(private val context: Context) {
                 base = targetAddon.transportUrl,
                 path = ResourcePath(
                     resource = "catalog",
-                    type_ = type,
+                    type = type,
                     id = catalogId
                 )
             )
 
+            val selected = CatalogsWithExtra.Selected(request = request)
             val action = Action(
-                load = ActionLoad(
-                    catalogsWithExtra = ActionLoad.CatalogsWithExtra(
-                        selected = CatalogsWithExtra.Selected(request = request)
-                    )
+                type = Action.Type.Load(
+                    ActionLoad(args = ActionLoad.Args.CatalogsWithExtra(selected))
                 )
             )
 
@@ -265,7 +257,7 @@ class StremioManager(private val context: Context) {
         }
     }
 
-    fun loadMetaDetails(type: String, id: String, videoId: String? = null, addon: Descriptor? = null) {
+    fun loadMetaDetails(type: String, id: String, videoId: String? = null, addon: AddonDescriptor? = null) {
         try {
             val targetAddon = addon ?: findAddonForResource("meta", type)
             if (targetAddon == null) {
@@ -275,26 +267,26 @@ class StremioManager(private val context: Context) {
 
             val metaPath = ResourcePath(
                 resource = "meta",
-                type_ = type,
+                type = type,
                 id = id
             )
 
             val streamPath = videoId?.let {
                 ResourcePath(
                     resource = "stream",
-                    type_ = type,
+                    type = type,
                     id = it
                 )
             }
 
+            val selected = MetaDetails.Selected(
+                metaPath = metaPath,
+                streamPath = streamPath,
+                guessStreamPath = streamPath == null
+            )
             val action = Action(
-                load = ActionLoad(
-                    metaDetails = ActionLoad.MetaDetails(
-                        selected = MetaDetails.Selected(
-                            metaPath = metaPath,
-                            streamPath = streamPath
-                        )
-                    )
+                type = Action.Type.Load(
+                    ActionLoad(args = ActionLoad.Args.MetaDetails(selected))
                 )
             )
 
@@ -323,7 +315,7 @@ class StremioManager(private val context: Context) {
                     base = it.transportUrl,
                     path = ResourcePath(
                         resource = "meta",
-                        type_ = type,
+                        type = type,
                         id = metaId
                     )
                 )
@@ -335,22 +327,21 @@ class StremioManager(private val context: Context) {
                         base = it.transportUrl,
                         path = ResourcePath(
                             resource = "stream",
-                            type_ = type,
+                            type = type,
                             id = vid
                         )
                     )
                 }
             }
 
+            val selected = Player.Selected(
+                stream = stream,
+                metaRequest = metaRequest,
+                streamRequest = streamRequest
+            )
             val action = Action(
-                load = ActionLoad(
-                    player = ActionLoad.Player(
-                        selected = Player.Selected(
-                            stream = stream,
-                            metaRequest = metaRequest,
-                            streamRequest = streamRequest
-                        )
-                    )
+                type = Action.Type.Load(
+                    ActionLoad(args = ActionLoad.Args.Player(selected))
                 )
             )
 
@@ -383,13 +374,11 @@ class StremioManager(private val context: Context) {
         loadAddonDetails(transportUrl)
     }
 
-    private fun installAddonWithDescriptor(descriptor: Descriptor) {
+    private fun installAddonWithDescriptor(descriptor: AddonDescriptor) {
         try {
             val action = Action(
-                ctx = ActionCtx(
-                    installAddon = ActionCtx.InstallAddon(
-                        descriptor = descriptor
-                    )
+                type = Action.Type.Ctx(
+                    ActionCtx(args = ActionCtx.Args.InstallAddon(descriptor))
                 )
             )
 
@@ -402,14 +391,13 @@ class StremioManager(private val context: Context) {
 
     fun uninstallAddon(transportUrl: String) {
         try {
+            val descriptor = AddonDescriptor(
+                transportUrl = transportUrl,
+                manifest = null
+            )
             val action = Action(
-                ctx = ActionCtx(
-                    uninstallAddon = ActionCtx.UninstallAddon(
-                        descriptor = Descriptor(
-                            transportUrl = transportUrl,
-                            manifest = null
-                        )
-                    )
+                type = Action.Type.Ctx(
+                    ActionCtx(args = ActionCtx.Args.UninstallAddon(descriptor))
                 )
             )
 
@@ -422,13 +410,14 @@ class StremioManager(private val context: Context) {
 
     fun updatePlayerTime(currentTime: Long, duration: Long) {
         try {
+            val playerItemState = ActionPlayer.PlayerItemState(
+                time = currentTime.toULong(),
+                duration = duration.toULong(),
+                device = "android"
+            )
             val action = Action(
-                player = ActionPlayer(
-                    timeChanged = ActionPlayer.TimeChanged(
-                        time = currentTime,
-                        duration = duration,
-                        device = "android"
-                    )
+                type = Action.Type.Player(
+                    ActionPlayer(args = ActionPlayer.Args.TimeChanged(playerItemState))
                 )
             )
 
@@ -441,8 +430,8 @@ class StremioManager(private val context: Context) {
     fun updatePlayerPaused(paused: Boolean) {
         try {
             val action = Action(
-                player = ActionPlayer(
-                    pausedChanged = ActionPlayer.PausedChanged(paused = paused)
+                type = Action.Type.Player(
+                    ActionPlayer(args = ActionPlayer.Args.PausedChanged(paused))
                 )
             )
 
